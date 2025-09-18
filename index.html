@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Calculatar</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module" crossorigin="anonymous" defer>
+        // Firebase imports
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, deleteDoc, addDoc, onSnapshot, collection, query, orderBy, serverTimestamp, updateDoc, setDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Firebase configuration and initialization
+        const firebaseConfig = {
+  apiKey: "AIzaSyDy5YOQlQhjiRWSyF5LToop-k1cyOA4tnA",
+  authDomain: "calculatarr.firebaseapp.com",
+  databaseURL: "https://calculatarr-default-rtdb.firebaseio.com",
+  projectId: "calculatarr",
+  storageBucket: "calculatarr.firebasestorage.app",
+  messagingSenderId: "20289379509",
+  appId: "1:20289379509:web:a9e74f6927c067086032fc"
+};
+const initialAuthToken = null;
+const appId = 'chat-app';
+
+        let db;
+        let auth;
+        let userId;
+        let currentReply = null;
+        let isCasting = false;
+        let cameraStream = null;
+        let isChatMode = false;
+        let currentMessages = [];
+        let mediaRecorder;
+        let audioChunks = [];
+        let lastClearTimestamp = null;
+        let typingTimeout;
+
+        const GIPHY_API_KEY = 'QISb3jDSZHYuMMz8XSUPjAVHGjsRDEiV'; // Replace with your Giphy API key
+
+        const initFirebase = async () => {
+            if (Object.keys(firebaseConfig).length === 0) {
+                console.error("Firebase config is not available. Please check the environment settings.");
+                return;
+            }
+            const app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+
+            setLogLevel('Debug');
+
+            if (initialAuthToken) {
+                try {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } catch (error) {
+                    console.error("Error signing in with custom token:", error);
+                    await signInAnonymously(auth);
+                }
+            } else {
+                await signInAnonymously(auth);
+            }
+            userId = auth.currentUser?.uid || (self.crypto && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2));
+            console.log("Authenticated with user ID:", userId);
+
+            const timestampFromStorage = localStorage.getItem(`last_clear_timestamp_${userId}_${appId}`);
+            if (timestampFromStorage) {
+                lastClearTimestamp = new Date(timestampFromStorage);
+            } else {
+                lastClearTimestamp = null;
+            }
+
+            const messagesCollectionRef = collection(db, `artifacts/${appId}/public/data/messages`);
+            const q = query(messagesCollectionRef, orderBy('timestamp'));
+
+            onSnapshot(q, (snapshot) => {
+                const messages = [];
+                snapshot.forEach(doc => {
+                    const messageData = doc.data();
+                    if (!lastClearTimestamp || !messageData.timestamp || messageData.timestamp.toDate() > lastClearTimestamp) {
+                        messages.push({ id: doc.id, ...messageData });
+                    }
+                });
+                currentMessages = messages;
+                renderMessages(messages);
+                if (isChatMode) {
+                    markVisibleMessagesAsRead();
+                }
+            });
+
+            // Listen for typing status updates
+            const typingCollectionRef = collection(db, `artifacts/${appId}/public/data/typing`);
+            onSnapshot(typingCollectionRef, (snapshot) => {
+                const typingUsers = [];
+                snapshot.forEach(doc => {
+                    const typingData = doc.data();
+                    if (typingData.isTyping && doc.id !== userId) {
+                        typingUsers.push(typingData.timestamp);
+                    }
+                });
+
+                const typingIndicator = document.getElementById('typingIndicator');
+                if (typingUsers.length > 0) {
+                    typingIndicator.classList.remove('hidden');
+                } else {
+                    typingIndicator.classList.add('hidden');
+                }
+            });
+        };
+
+        const updateTypingStatus = async (isTyping) => {
+            if (!userId) return;
+            const typingDocRef = doc(db, `artifacts/${appId}/public/data/typing`, userId);
+            await setDoc(typingDocRef, { isTyping, timestamp: serverTimestamp() }, { merge: true });
+        };
+
+        const formatSeenTime = (timestamp) => {
+            if (!timestamp) return '';
+            const date = timestamp.toDate();
+            const now = new Date();
+            const diffSeconds = Math.floor((now - date) / 1000);
+
+            if (diffSeconds < 5) return 'just now';
+            if (diffSeconds < 60) return `${diffSeconds} seconds ago`;
+            const diffMinutes = Math.floor(diffSeconds / 60);
+            if (diffMinutes < 60) return `${diffMinutes} minute${diffMinutes > 1 ? 's' : ''} ago`;
+            const diffHours = Math.floor(diffMinutes / 60);
+            if (diffHours < 24) return `${diffHours} hour${diffHours > 1 ? 's' : ''} ago`;
+            return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        };
+
+        const renderMessages = (messages) => {
+            const chatBox = document.getElementById('chatBox');
+            chatBox.innerHTML = '';
+            messages.forEach(msg => {
+                const messageContainer = document.createElement('div');
+                messageContainer.classList.add('flex', 'flex-col', 'my-1', 'w-full');
+                
+                if (msg.userId === userId) {
+                    messageContainer.classList.add('items-end');
+                } else {
+                    messageContainer.classList.add('items-start');
+                }
+
+                const messageElement = document.createElement('div');
+                messageElement.classList.add('p-2', 'rounded-lg', 'cursor-pointer', 'max-w-[75%]', 'word-break-all');
+
+                if (msg.userId === userId) {
+                    messageElement.classList.add('bg-blue-500', 'text-white', 'rounded-br-none');
+                } else {
+                    messageElement.classList.add('bg-gray-200', 'text-gray-800', 'rounded-bl-none');
+                }
+
+                if (msg.repliedTo) {
+                    const replyContext = document.createElement('div');
+                    replyContext.classList.add('bg-gray-400', 'text-sm', 'p-1', 'rounded-md', 'mb-1', 'truncate');
+                    replyContext.textContent = `${msg.repliedTo.content}`;
+                    messageElement.appendChild(replyContext);
+                }
+
+                if (msg.type === 'text') {
+                    const messageText = document.createElement('p');
+                    messageText.textContent = msg.content;
+                    messageElement.appendChild(messageText);
+                } else if (msg.type === 'image') {
+                    const messageImage = document.createElement('img');
+                    messageImage.src = msg.content;
+                    messageImage.classList.add('rounded-lg', 'max-w-full', 'max-h-60', 'object-contain');
+                    messageElement.classList.remove('p-2');
+                    messageElement.appendChild(messageImage);
+                } else if (msg.type === 'gif' || msg.type === 'sticker') {
+                    const messageGif = document.createElement('img');
+                    messageGif.src = msg.content;
+                    messageGif.classList.add('rounded-lg', 'max-w-full', 'max-h-60', 'object-contain');
+                    messageElement.classList.remove('p-2');
+                    messageElement.appendChild(messageGif);
+                } else if (msg.type === 'audio') {
+                    const audioElement = document.createElement('audio');
+                    audioElement.controls = true;
+                    audioElement.src = msg.content;
+                    audioElement.classList.add('w-full', 'max-w-xs');
+                    messageElement.classList.remove('p-2');
+                    messageElement.appendChild(audioElement);
+                }
+                
+                messageElement.addEventListener('click', () => {
+                    currentReply = { id: msg.id, content: msg.content };
+                    document.getElementById('replyBox').classList.remove('hidden');
+                    document.getElementById('replyContent').textContent = msg.type === 'text' ? currentReply.content : (msg.type === 'image' ? 'Image' : msg.type === 'gif' ? 'GIF' : 'Sticker');
+                    document.getElementById('chatInput').focus();
+                });
+                
+                messageElement.addEventListener('contextmenu', (e) => {
+                    e.preventDefault();
+                    if (msg.userId === userId) {
+                        const deleteModal = document.getElementById('deleteModal');
+                        deleteModal.classList.remove('hidden');
+                        document.getElementById('deleteButton').onclick = () => {
+                            deleteMessage(msg.id);
+                            deleteModal.classList.add('hidden');
+                        };
+                        document.getElementById('cancelDeleteButton').onclick = () => {
+                            deleteModal.classList.add('hidden');
+                        };
+                    }
+                });
+                messageContainer.appendChild(messageElement);
+                chatBox.appendChild(messageContainer);
+            });
+
+            const lastMessage = messages.length > 0 ? messages[messages.length - 1] : null;
+            if (lastMessage && lastMessage.userId === userId && lastMessage.status === 'read' && lastMessage.readAt) {
+                const seenStatusContainer = document.createElement('div');
+                seenStatusContainer.classList.add('flex', 'justify-end', 'w-full', 'pr-2', 'mt-1');
+                const seenStatusText = document.createElement('p');
+                seenStatusText.classList.add('text-xs', 'text-gray-400');
+                seenStatusText.textContent = `Seen ${formatSeenTime(lastMessage.readAt)}`;
+                seenStatusContainer.appendChild(seenStatusText);
+                chatBox.appendChild(seenStatusContainer);
+            }
+
+            chatBox.scrollTop = chatBox.scrollHeight;
+        };
+        
+        const clearChatLocally = () => {
+            const now = new Date();
+            lastClearTimestamp = now;
+            localStorage.setItem(`last_clear_timestamp_${userId}_${appId}`, now.toISOString());
+            renderMessages([]);
+        };
+
+        const sendMessage = async (type, content) => {
+            if (!content) return;
+            try {
+                await updateTypingStatus(false);
+                const messagesCollectionRef = collection(db, `artifacts/${appId}/public/data/messages`);
+                const messageData = {
+                    type,
+                    content,
+                    userId,
+                    timestamp: serverTimestamp(),
+                    status: 'sent'
+                };
+
+                if (currentReply) {
+                    messageData.repliedTo = { id: currentReply.id, content: currentReply.content };
+                    currentReply = null;
+                    document.getElementById('replyBox').classList.add('hidden');
+                }
+
+                await addDoc(messagesCollectionRef, messageData);
+            } catch (e) {
+                console.error("Error adding document: ", e);
+            }
+        };
+        
+        const markMessageAsRead = async (messageId) => {
+            try {
+                const messageDocRef = doc(db, `artifacts/${appId}/public/data/messages`, messageId);
+                await updateDoc(messageDocRef, { status: 'read', readAt: serverTimestamp() });
+            } catch (e) { console.error("Error marking message as read:", e); }
+        };
+        
+        const markVisibleMessagesAsRead = () => {
+            currentMessages.forEach(msg => {
+                if (msg.userId !== userId && msg.status !== 'read') {
+                    markMessageAsRead(msg.id);
+                }
+            });
+        };
+
+        const deleteMessage = async (messageId) => {
+            try {
+                await deleteDoc(doc(db, `artifacts/${appId}/public/data/messages`, messageId));
+            } catch (e) { console.error("Error deleting message:", e); }
+        };
+
+        const showCameraModal = async () => {
+            const cameraModal = document.getElementById('cameraModal');
+            const videoElement = document.getElementById('cameraVideo');
+            cameraModal.classList.remove('hidden');
+            try {
+                cameraStream = await navigator.mediaDevices.getUserMedia({ video: true });
+                videoElement.srcObject = cameraStream;
+            } catch (err) {
+                console.error("Error accessing camera:", err);
+                closeCameraModal();
+            }
+        };
+
+        const closeCameraModal = () => {
+            const cameraModal = document.getElementById('cameraModal');
+            if (cameraStream) {
+                cameraStream.getTracks().forEach(track => track.stop());
+                cameraStream = null;
+            }
+            cameraModal.classList.add('hidden');
+        };
+
+        const takePhoto = () => {
+            const videoElement = document.getElementById('cameraVideo');
+            const canvasElement = document.getElementById('cameraCanvas');
+            const context = canvasElement.getContext('2d');
+            canvasElement.width = videoElement.videoWidth;
+            canvasElement.height = videoElement.videoHeight;
+            context.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+            sendMessage('image', canvasElement.toDataURL('image/jpeg'));
+            closeCameraModal();
+        };
+
+        const showGifModal = (isStickerMode = false) => {
+            const gifModal = document.getElementById('gifModal');
+            const gifSearchInput = document.getElementById('gifSearchInput');
+            const gifModalTitle = document.getElementById('gifModalTitle');
+            gifModal.classList.remove('hidden');
+            if (isStickerMode) {
+                gifModalTitle.textContent = 'Send Sticker';
+                gifSearchInput.dataset.type = 'sticker';
+            } else {
+                gifModalTitle.textContent = 'Send GIF';
+                gifSearchInput.dataset.type = 'gif';
+            }
+            loadGifs(gifSearchInput.value, isStickerMode);
+        };
+
+        const closeGifModal = () => {
+            document.getElementById('gifModal').classList.add('hidden');
+            document.getElementById('gifSearchInput').value = '';
+            document.getElementById('gifGrid').innerHTML = '';
+        };
+
+        const loadGifs = async (query = '', isStickerMode = false) => {
+            const gifGrid = document.getElementById('gifGrid');
+            const loadingIndicator = document.getElementById('gifLoadingIndicator');
+            gifGrid.innerHTML = '';
+            loadingIndicator.classList.remove('hidden');
+
+            const endpoint = isStickerMode ? 'stickers/search' : (query ? 'gifs/search' : 'gifs/trending');
+            const url = `https://api.giphy.com/v1/${endpoint}?api_key=${GIPHY_API_KEY}&q=${query}&limit=50&rating=g`;
+
+            try {
+                const response = await fetch(url);
+                if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                const { data } = await response.json();
+                loadingIndicator.classList.add('hidden');
+                
+                if (data.length === 0) {
+                    gifGrid.innerHTML = '<p class="text-gray-400">No GIFs found.</p>';
+                    return;
+                }
+
+                data.forEach(gif => {
+                    const img = document.createElement('img');
+                    img.src = gif.images.fixed_height.url;
+                    img.classList.add('rounded-lg', 'cursor-pointer', 'shadow-md', 'transition-transform', 'hover:scale-105');
+                    img.alt = gif.title;
+                    img.addEventListener('click', () => {
+                        sendMessage(isStickerMode ? 'sticker' : 'gif', img.src);
+                        closeGifModal();
+                    });
+                    gifGrid.appendChild(img);
+                });
+            } catch (error) {
+                console.error('Error loading GIFs:', error);
+                loadingIndicator.classList.add('hidden');
+                gifGrid.innerHTML = '<p class="text-red-400">Failed to load GIFs.</p>';
+            }
+        };
+        
+        const startRecording = async () => {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                mediaRecorder.start();
+                document.getElementById('micButton').classList.add('bg-red-500', 'animate-pulse');
+                mediaRecorder.addEventListener('dataavailable', event => audioChunks.push(event.data));
+            } catch (err) { console.error("Error accessing microphone:", err); }
+        };
+
+        const stopRecording = () => {
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+                document.getElementById('micButton').classList.remove('bg-red-500', 'animate-pulse');
+                mediaRecorder.addEventListener('stop', () => {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                    const reader = new FileReader();
+                    reader.readAsDataURL(audioBlob);
+                    reader.onloadend = () => {
+                        sendMessage('audio', reader.result);
+                        audioChunks = [];
+                    };
+                });
+            }
+        };
+
+        window.onload = () => {
+            initFirebase();
+
+            const screen = document.getElementById('screen');
+            const chatContainer = document.getElementById('chatContainer');
+            const calculatorContainer = document.getElementById('calculatorContainer');
+            const castOverlay = document.getElementById('castOverlay');
+            const settingsModal = document.getElementById('settingsModal');
+            const passwordInput = document.getElementById('passwordInput');
+            const buttons = document.querySelectorAll('.calculator-btn');
+            const chatInput = document.getElementById('chatInput');
+            const actionIcons = document.getElementById('actionIcons');
+            const sendButton = document.getElementById('sendButton');
+            const defaultPassword = '8107';
+            let secretPassword = localStorage.getItem('chatPassword') || defaultPassword;
+            let currentInput = '';
+            const CHAT_INPUT_MAX_HEIGHT = 150;
+
+            const updateScreen = () => {
+                screen.textContent = currentInput || '';
+            };
+
+            const toggleMode = (isChat) => {
+                isChatMode = isChat;
+                calculatorContainer.classList.toggle('hidden', isChat);
+                chatContainer.classList.toggle('hidden', !isChat);
+                if (isChat) {
+                    chatInput.focus();
+                    markVisibleMessagesAsRead();
+                } else {
+                    currentInput = '';
+                    updateScreen();
+                }
+            };
+            
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'visible') {
+                    toggleMode(false); // Force back to calculator on app resume
+                    if (isChatMode) {
+                        markVisibleMessagesAsRead();
+                    }
+                }
+            });
+
+            const checkCasting = () => {
+                if (navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia) {
+                    navigator.mediaDevices.getDisplayMedia({ video: true }).then(stream => {
+                        isCasting = true;
+                        castOverlay.classList.remove('hidden');
+                        stream.getTracks().forEach(track => track.stop());
+                    }).catch(() => {
+                        isCasting = false;
+                        castOverlay.classList.add('hidden');
+                    });
+                }
+            };
+
+            checkCasting();
+            setInterval(checkCasting, 5000);
+
+            buttons.forEach(button => {
+                button.addEventListener('click', () => {
+                    const value = button.textContent;
+                    if (value === 'C') {
+                        currentInput = '';
+                    } else if (value === '=') {
+                        if (currentInput === secretPassword) {
+                            toggleMode(true);
+                        } else {
+                            try {
+                                currentInput = eval(currentInput.replace('×', '*').replace('÷', '/')).toString();
+                            } catch { currentInput = 'Error'; }
+                        }
+                    } else {
+                        currentInput += value;
+                    }
+                    updateScreen();
+                });
+            });
+
+            document.getElementById('chatForm').addEventListener('submit', (e) => {
+                e.preventDefault();
+                sendMessage('text', chatInput.value);
+                chatInput.value = '';
+                chatInput.dispatchEvent(new Event('input'));
+            });
+            
+            chatInput.addEventListener('input', () => {
+                clearTimeout(typingTimeout);
+                updateTypingStatus(true);
+                typingTimeout = setTimeout(() => {
+                    updateTypingStatus(false);
+                }, 2000);
+
+                if (chatInput.value.trim() !== '') {
+                    actionIcons.classList.add('hidden');
+                    sendButton.classList.remove('hidden');
+                } else {
+                    actionIcons.classList.remove('hidden');
+                    sendButton.classList.add('hidden');
+                }
+                chatInput.style.height = 'auto';
+                chatInput.style.height = `${Math.min(chatInput.scrollHeight, CHAT_INPUT_MAX_HEIGHT)}px`;
+            });
+            chatInput.addEventListener('blur', () => {
+                updateTypingStatus(false);
+            });
+
+
+            document.getElementById('backButton').addEventListener('click', () => toggleMode(false));
+            document.getElementById('cancelReplyButton').addEventListener('click', () => {
+                currentReply = null;
+                document.getElementById('replyBox').classList.add('hidden');
+            });
+            
+            document.getElementById('inputCameraButton').addEventListener('click', showCameraModal);
+            
+            const galleryButton = document.getElementById('galleryButton');
+            const imageInput = document.getElementById('imageInput');
+            galleryButton.addEventListener('click', () => imageInput.click());
+            imageInput.addEventListener('change', (event) => {
+                const file = event.target.files[0];
+                if (file) {
+                    const reader = new FileReader();
+                    reader.readAsDataURL(file);
+                    reader.onloadend = () => sendMessage('image', reader.result);
+                }
+            });
+
+            const micButton = document.getElementById('micButton');
+            micButton.addEventListener('mousedown', startRecording);
+            micButton.addEventListener('mouseup', stopRecording);
+            micButton.addEventListener('touchstart', (e) => { e.preventDefault(); startRecording(); });
+            micButton.addEventListener('touchend', (e) => { e.preventDefault(); stopRecording(); });
+
+            document.getElementById('takePhotoButton').addEventListener('click', takePhoto);
+            document.getElementById('closeCameraButton').addEventListener('click', closeCameraModal);
+            document.getElementById('gifSearchButton').addEventListener('click', () => loadGifs(document.getElementById('gifSearchInput').value, document.getElementById('gifSearchInput').dataset.type === 'sticker'));
+            document.getElementById('gifSearchInput').addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    loadGifs(e.target.value, e.target.dataset.type === 'sticker');
+                }
+            });
+            document.getElementById('closeGifModalButton').addEventListener('click', closeGifModal);
+
+            const showSettingsModal = () => settingsModal.classList.remove('hidden');
+            const closeSettingsModal = () => settingsModal.classList.add('hidden');
+            document.getElementById('settingsButton').addEventListener('click', showSettingsModal);
+            document.getElementById('gifButton').addEventListener('click', () => showGifModal(false));
+            document.getElementById('stickerButton').addEventListener('click', () => showGifModal(true));
+            document.getElementById('closeSettingsButton').addEventListener('click', closeSettingsModal);
+            document.getElementById('changePasswordButton').addEventListener('click', () => {
+                const newPassword = passwordInput.value;
+                if (newPassword && newPassword.length > 0) {
+                    secretPassword = newPassword;
+                    localStorage.setItem('chatPassword', newPassword);
+                    closeSettingsModal();
+                }
+            });
+
+            document.getElementById('clearChatButtonInSettings').addEventListener('click', () => {
+                const confirmClear = document.getElementById('confirmClearMessage');
+                const clearButton = document.getElementById('confirmClearChatButton');
+                
+                confirmClear.classList.remove('hidden');
+                clearButton.classList.remove('hidden');
+            });
+
+            document.getElementById('confirmClearChatButton').addEventListener('click', () => {
+                clearChatLocally();
+                closeSettingsModal();
+            });
+        };
+    </script>
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        .word-break-all { overflow-wrap: break-word; word-break: break-all; }
+        .chat-textarea { resize: none; overflow-y: auto; }
+        audio::-webkit-media-controls-panel { background-color: #4a5568; }
+        audio::-webkit-media-controls-play-button,
+        audio::-webkit-media-controls-current-time-display,
+        audio::-webkit-media-controls-time-remaining-display,
+        audio::-webkit-media-controls-volume-slider,
+        audio::-webkit-media-controls-mute-button { filter: invert(1); }
+    </style>
+</head>
+<body class="bg-gray-900 flex items-center justify-center min-h-screen">
+    <div class="p-4 sm:p-6 bg-gray-800 shadow-xl rounded-2xl w-full max-w-sm">
+        <div id="calculatorContainer">
+            <div id="screen" class="bg-gray-700 text-white text-right p-4 rounded-xl text-3xl font-mono mb-4 overflow-x-auto"></div>
+            <div class="grid grid-cols-4 gap-3">
+                <button class="calculator-btn bg-gray-700 text-white rounded-xl p-4 text-2xl shadow-md transition-all hover:bg-gray-600 active:shadow-none">C</button>
+                <button class="calculator-btn bg-gray-700 text-white rounded-xl p-4 text-2xl shadow-md transition-all hover:bg-gray-600 active:shadow-none">÷</button>
+                <button class="calculator-btn bg-gray-700 text-white rounded-xl p-4 text-2xl shadow-md transition-all hover:bg-gray-600 active:shadow-none">×</button>
+                <button class="calculator-btn bg-gray-700 text-white rounded-xl p-4 text-2xl shadow-md transition-all hover:bg-gray-600 active:shadow-none">-</button>
+                <button class="calculator-btn bg-gray-600 text-white rounded-xl p-4 text-2xl shadow-md transition-all hover:bg-gray-500 active:shadow-none">7</button>
+                <button class="calculator-btn bg-gray-600 text-white rounded-xl p-4 text-2xl shadow-md transition-all hover:bg-gray-500 active:shadow-none">8</button>
+                <button class="calculator-btn bg-gray-600 text-white rounded-xl p-4 text-2xl shadow-md transition-all hover:bg-gray-500 active:shadow-none">9</button>
+                <button class="calculator-btn bg-gray-700 text-white rounded-xl p-4 text-2xl shadow-md transition-all hover:bg-gray-600 active:shadow-none">+</button>
+                <button class="calculator-btn bg-gray-600 text-white rounded-xl p-4 text-2xl shadow-md transition-all hover:bg-gray-500 active:shadow-none">4</button>
+                <button class="calculator-btn bg-gray-600 text-white rounded-xl p-4 text-2xl shadow-md transition-all hover:bg-gray-500 active:shadow-none">5</button>
+                <button class="calculator-btn bg-gray-600 text-white rounded-xl p-4 text-2xl shadow-md transition-all hover:bg-gray-500 active:shadow-none">6</button>
+                <button class="calculator-btn bg-blue-600 text-white row-span-2 rounded-xl p-4 text-2xl shadow-md transition-all hover:bg-blue-700 active:shadow-none">=</button>
+                <button class="calculator-btn bg-gray-600 text-white rounded-xl p-4 text-2xl shadow-md transition-all hover:bg-gray-500 active:shadow-none">1</button>
+                <button class="calculator-btn bg-gray-600 text-white rounded-xl p-4 text-2xl shadow-md transition-all hover:bg-gray-500 active:shadow-none">2</button>
+                <button class="calculator-btn bg-gray-600 text-white rounded-xl p-4 text-2xl shadow-md transition-all hover:bg-gray-500 active:shadow-none">3</button>
+                <button class="calculator-btn bg-gray-600 text-white col-span-2 rounded-xl p-4 text-2xl shadow-md transition-all hover:bg-gray-500 active:shadow-none">0</button>
+                <button class="calculator-btn bg-gray-600 text-white rounded-xl p-4 text-2xl shadow-md transition-all hover:bg-gray-500 active:shadow-none">.</button>
+            </div>
+        </div>
+
+        <div id="chatContainer" class="hidden h-[550px] flex flex-col relative">
+            <div class="flex items-center justify-between p-2">
+                <button id="backButton" class="p-2 text-white rounded-full hover:bg-gray-700">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" /></svg>
+                </button>
+                <div class="flex-grow text-center">
+                    <h2 class="text-white text-2xl font-bold">GOMU</h2>
+                </div>
+                <div class="flex space-x-2">
+                    <button id="gifButton" class="p-2 text-white rounded-full hover:bg-gray-700">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.828 14.828a4 4 0 01-5.656 0M9 10h.01M15 10h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                    </button>
+                     <button id="stickerButton" class="p-2 text-white rounded-full hover:bg-gray-700">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M15.5 13.5c.828 0 1.5.672 1.5 1.5s-.672 1.5-1.5 1.5-1.5-.672-1.5-1.5.672-1.5 1.5-1.5z"/><path stroke-linecap="round" stroke-linejoin="round" d="M12 21.08c-4.49 0-8.125-3.635-8.125-8.125S7.51 4.83 12 4.83c4.49 0 8.125 3.635 8.125 8.125S16.49 21.08 12 21.08zM12 4.08c-4.99 0-9 4.01-9 9s4.01 9 9 9 9-4.01 9-9-4.01-9-9-9z"/><path stroke-linecap="round" stroke-linejoin="round" d="M12 12c-1.38 0-2.5-1.12-2.5-2.5S10.62 7 12 7s2.5 1.12 2.5 2.5S13.38 12 12 12z"/></svg>
+                    </button>
+                    <button id="settingsButton" class="p-2 text-white rounded-full hover:bg-gray-700">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37-2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+                    </button>
+                </div>
+            </div>
+            
+            <div id="typingIndicator" class="text-gray-400 text-xs text-center mt-1 hidden">Typing...</div>
+            <div id="chatBox" class="flex-grow p-4 overflow-y-auto mb-2 flex flex-col"></div>
+            
+            <div id="replyBox" class="bg-gray-700 p-2 rounded-t-lg mx-2 hidden">
+                <div class="flex items-center justify-between">
+                    <p class="text-white text-sm truncate" id="replyContent"></p>
+                    <button id="cancelReplyButton" class="text-gray-400 text-xl">&times;</button>
+                </div>
+            </div>
+
+            <form id="chatForm" class="flex items-end space-x-2 p-2 bg-gray-800">
+                <button id="inputCameraButton" type="button" class="flex-shrink-0 w-10 h-10 bg-pink-600 rounded-full flex items-center justify-center text-white text-xl hover:bg-pink-700">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" /><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+                </button>
+                <div class="flex-grow flex items-end bg-gray-700 rounded-2xl px-3 py-1">
+                    <textarea id="chatInput" placeholder="Message..." class="flex-grow bg-transparent text-white focus:outline-none chat-textarea" rows="1"></textarea>
+                    <div id="actionIcons" class="flex items-center space-x-1">
+                        <button id="micButton" type="button" class="p-2 text-gray-300 hover:text-white"><svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" /></svg></button>
+                        <button id="galleryButton" type="button" class="p-2 text-gray-300 hover:text-white"><svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg></button>
+                    </div>
+                    <button id="sendButton" type="submit" class="p-2 text-blue-400 hover:text-blue-300 hidden"><svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-8.707l-3-3a1 1 0 00-1.414 1.414L10.586 9H7a1 1 0 100 2h3.586l-1.293 1.293a1 1 0 101.414 1.414l3-3a1 1 0 000-1.414z" clip-rule="evenodd" /></svg></button>
+                </div>
+                <input type="file" id="imageInput" class="hidden" accept="image/*">
+            </form>
+        </div>
+    </div>
+    
+    <div id="cameraModal" class="fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center hidden z-50"><div class="bg-gray-800 p-6 rounded-lg shadow-xl text-center flex flex-col items-center"><h2 class="text-white text-2xl mb-4">Take Photo</h2><video id="cameraVideo" class="w-full max-w-sm rounded-lg" autoplay playsinline></video><canvas id="cameraCanvas" class="hidden"></canvas><div class="flex justify-center space-x-4 mt-4"><button id="takePhotoButton" class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700">Take Photo</button><button id="closeCameraButton" class="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700">Close</button></div></div></div>
+    <div id="gifModal" class="fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center hidden z-50"><div class="bg-gray-800 p-6 rounded-lg shadow-xl text-center flex flex-col w-full max-w-lg h-3/4"><div class="flex justify-between items-center mb-4"><h2 id="gifModalTitle" class="text-white text-2xl">Send GIF</h2><button id="closeGifModalButton" class="text-gray-400 text-3xl">&times;</button></div><div class="flex items-center mb-4"><input type="text" id="gifSearchInput" placeholder="Search GIF" class="flex-grow p-2 rounded-lg border border-gray-600 bg-gray-700 text-white focus:outline-none focus:ring-2 focus:ring-blue-500"><button id="gifSearchButton" class="ml-2 px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600">Search</button></div><div id="gifLoadingIndicator" class="text-white text-center hidden">Loading GIFs...</div><div id="gifGrid" class="flex-grow grid grid-cols-2 sm:grid-cols-3 gap-2 overflow-y-auto"></div></div></div>
+    <div id="deleteModal" class="fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center hidden"><div class="bg-gray-800 p-6 rounded-lg shadow-xl text-center"><p class="text-white text-lg mb-4">Delete this message for everyone?</p><div class="flex justify-center space-x-4"><button id="deleteButton" class="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700">Yes, delete</button><button id="cancelDeleteButton" class="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700">No, cancel</button></div></div></div>
+    <div id="settingsModal" class="fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center hidden">
+        <div class="bg-gray-800 p-6 rounded-lg shadow-xl text-center">
+            <h2 class="text-white text-2xl mb-4">Settings</h2>
+            <div class="flex flex-col space-y-4">
+                <div>
+                    <h3 class="text-white text-lg mb-2">Change Password</h3>
+                    <input id="passwordInput" type="password" placeholder="Enter new password" class="w-full p-2 rounded-lg bg-gray-700 text-white border border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    <button id="changePasswordButton" class="mt-2 w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">Change Password</button>
+                </div>
+                <div>
+                    <h3 class="text-white text-lg mb-2">Clear Chat</h3>
+                    <p class="text-gray-400 text-sm mb-2">This will only clear the chat from your screen, not for other users.</p>
+                    <button id="clearChatButtonInSettings" class="w-full px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700">Clear Chat</button>
+                    <p id="confirmClearMessage" class="text-red-400 text-xs mt-2 hidden">Are you sure?</p>
+                    <button id="confirmClearChatButton" class="w-full mt-2 px-4 py-2 bg-red-700 text-white rounded-lg hover:bg-red-800 hidden">Yes, clear</button>
+                </div>
+                <button id="closeSettingsButton" class="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700">Close</button>
+            </div>
+        </div>
+    </div>
+    
+    <div id="castOverlay" class="fixed inset-0 bg-black flex items-center justify-center z-50 hidden"></div>
+</body>
+</html>
